@@ -53,9 +53,33 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 port() {
-  local start=$((20000 + ($$ + RANDOM) % 20000)) candidate
-  for offset in $(seq 0 999); do
-    candidate=$((20000 + ((start - 20000 + offset) % 20000)))
+  local dynamic_start=32768 dynamic_end=60999
+  if [[ -r /proc/sys/net/ipv4/ip_local_port_range ]]; then
+    read -r dynamic_start dynamic_end < /proc/sys/net/ipv4/ip_local_port_range
+  fi
+
+  # PostgreSQL client connections use kernel-assigned ephemeral source ports.
+  # Do not offer those ports to the HTTP listeners: a live or recently closed
+  # DB connection can make bind(2) fail even though a TCP connect probe says
+  # that no listener owns the candidate.
+  local min_port=20000 max_port=65000
+  local lower_end=$((dynamic_start - 1))
+  (( lower_end > max_port )) && lower_end=$max_port
+  local lower_count=$((lower_end >= min_port ? lower_end - min_port + 1 : 0))
+  local upper_start=$((dynamic_end + 1))
+  (( upper_start < min_port )) && upper_start=$min_port
+  local upper_count=$((upper_start <= max_port ? max_port - upper_start + 1 : 0))
+  local count=$((lower_count + upper_count))
+  (( count > 0 )) || { echo "no non-ephemeral HTTP listener ports available" >&2; return 1; }
+
+  local start=$((RANDOM % count)) candidate offset
+  for offset in $(seq 0 $((count - 1))); do
+    local index=$(((start + offset) % count))
+    if (( index < lower_count )); then
+      candidate=$((min_port + index))
+    else
+      candidate=$((upper_start + index - lower_count))
+    fi
     if ! (exec 3<>"/dev/tcp/127.0.0.1/$candidate") 2>/dev/null; then
       printf '%s\n' "$candidate"
       return 0
